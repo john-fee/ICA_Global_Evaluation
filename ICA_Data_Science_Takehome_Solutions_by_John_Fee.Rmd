@@ -102,8 +102,7 @@ It looks like 2008 had the highest number of recorded adverse events!  However, 
 event_data %>%
   # bring in a few extra variables
   select(adverse_event_flag,date_of_event,event_type,product_problems) %>%
-  filter(!(adverse_event_flag %in% c("Y","N"))) %>% 
-  knitr::kable()
+  filter(!(adverse_event_flag %in% c("Y","N")))
 ```
 
 Many of the events are missing context in both the `event_type` and `product_problems` fields, so I'm going to count them as non-adverse events for the purposes of this analysis.  However, there are some events that have an `NA` flag in `adverse_event_flag`, but their `event_type` indicates they are an adverse event.  Let's fix this.  First, we need the to map the `event_type` categories to adverse events.
