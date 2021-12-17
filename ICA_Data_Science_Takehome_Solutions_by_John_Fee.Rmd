@@ -1,0 +1,362 @@
+---
+title: "ICA Data Science Takehome"
+author: "John Fee"
+date: "12/15/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = TRUE,
+  include = TRUE,
+  warning = FALSE,
+  message = FALSE
+  )
+```
+
+```{r}
+library(dplyr) # Data processing
+library(here) # Easier file paths
+library(readr) # Load data
+library(lubridate)
+library(ggplot2)
+library(renv) # Dependency tracking
+```
+
+
+# Load Data and Inspect
+
+```{r}
+event_data_raw <- readr::read_csv(here("data","event_data_subset.csv"),guess_max = 1000)
+head(event_data_raw)
+```
+
+There are a lot of of columns - including a whole bunch at the end look like they may not include anything.  Let's check.
+
+```{r}
+event_data_raw %>%
+  summarize_all(funs(all(is.na(.)))) %>%
+  select(starts_with("X")) %>%
+  summarize(
+    n_columns = ncol(.),
+    n_empty = rowSums(.)
+    )
+```
+Looks like we safely drop these - maybe there were extra commas in the csv file?
+
+```{r}
+event_data <- event_data_raw %>% select(-starts_with("X"))
+```
+
+
+# Exploratory Analysis
+
+## Part 1
+
+Which year had the highest number of recorded adverse events across all devices?
+
+## Solution
+
+To answer this question, we need check whether each event (row) was adverse, then count the number of adverse events that occurred in each year.  So fundamentally we need to
+
+1. Select the `adverse_event_flag` and `date_of_event` columns.
+3. Parse the `date_of_event` variable and extract the year.
+4. Count the number of adverse events within each year and report the year with the highest # of adverse events.
+
+```{r}
+temp_df <- event_data %>%
+  select(adverse_event_flag,date_of_event) %>%
+  mutate(
+    # Parse date (assuming ymd is the correct format) and extract year
+    date_of_event = lubridate::ymd(date_of_event),
+    year_of_event = lubridate::year(date_of_event)
+    )
+```
+
+Let's check the `adverse_event_flag` variable.
+
+```{r}
+temp_df %>% pull(adverse_event_flag) %>% unique()
+```
+`Y` and `N` are unambiguous.  If this question hinges on what has explicitly been recorded as `Y` in the `adverse_event_flag` variable, then we just need to count the `Y`s by year.  Note that some events don't have a year associated with them (so I exclude them).
+
+```{r}
+temp_df %>%
+  # Filter out NA years
+  filter(!is.na(year_of_event)) %>%
+  # Get only the "Y" adverse event flags
+  mutate(adverse_event = if_else(adverse_event_flag == "Y",TRUE,FALSE,missing = FALSE)) %>%
+  # Get the max adverse events that occurred for any year
+  group_by(year_of_event) %>%
+  summarize(n_of_adverse_events = sum(adverse_event)) %>%
+  filter(n_of_adverse_events == max(n_of_adverse_events)) %>%
+  knitr::kable()
+```
+
+It looks like 2008 had the highest number of recorded adverse events!  However, this approach relies on the interpretation of "recorded" as a `Y` enterered in the `adverse_event_flag` column.  Let's try to improve upon this approach by inspecting the non `Y` events.
+
+```{r}
+event_data %>%
+  # bring in a few extra variables
+  select(adverse_event_flag,date_of_event,event_type,product_problems) %>%
+  filter(!(adverse_event_flag %in% c("Y","N"))) %>% 
+  knitr::kable()
+```
+
+Many of the events are missing context in both the `event_type` and `product_problems` fields, so I'm going to count them as non-adverse events for the purposes of this analysis.  However, there are some events that have an `NA` flag in `adverse_event_flag`, but their `event_type` indicates they are an adverse event.  Let's fix this.  First, we need the to map the `event_type` categories to adverse events.
+
+```{r}
+event_data %>% pull(event_type) %>% unique()
+```
+
+Since the `product_problems` column is NA for all of the cases we are interested in, `Death`, `Malfunction`, and `Injury` are the only clear indicators that the event is adverse.  Let's map those to adverse events, and everything else to otherwise.
+
+```{r}
+temp_df <- event_data %>%
+  select(adverse_event_flag,date_of_event,event_type,product_problems) %>%
+  mutate(
+    # Parse date (assuming ymd is the correct format) and extract year
+    date_of_event = lubridate::ymd(date_of_event),
+    year_of_event = lubridate::year(date_of_event),
+    # Create a supplementary adverse event flag based on event_type
+    event_type_indicates_adverse = case_when(
+      event_type == "Death" ~ TRUE,
+      event_type == "Malfunction" ~ TRUE,
+      event_type == "Injury" ~ TRUE,
+      TRUE ~ FALSE
+      ),
+    # Then create an updated adverse_event_flag
+    adverse_event_flag_updated = if_else(adverse_event_flag == "Y",TRUE,FALSE,missing = FALSE),
+    adverse_event_flag_updated = adverse_event_flag_updated | event_type_indicates_adverse
+    )
+```
+
+Now we can count the number of adverse events as before and find the year with the most.
+
+```{r}
+temp_df %>%
+  # Filter out missing years
+  filter(!is.na(year_of_event)) %>%
+  # Get the max adverse events that occurred for any year
+  group_by(year_of_event) %>%
+  summarize(n_of_adverse_events = sum(adverse_event_flag_updated)) %>%
+  filter(n_of_adverse_events == max(n_of_adverse_events)) %>% 
+  knitr::kable()
+```
+
+The year with the most adverse events is still 2008, but with a much higher count!
+
+## Part 2
+
+Which device category (by product code) had the highest number of adverse events resulting in Injury (not death)?
+
+## Solution
+
+To answer this question, I need to extract the `device_report_product_code` variable from the JSON inside of the `device` column, then count up the adverse events related to `Injury` only. So I need to
+
+1. Write a function to extract the `device_report_product_code`.
+2. Count the number of adverse events that relate to `Injury` for each unique `device_report_product_code` value
+
+`R` doesn't appear to have a good way to parse relaxed JSON, so I take a crude pattern matching approach.
+
+```{r}
+get_product_code<- function(string){
+  # Split json by strings and find the index that contains the device_report_product_code
+  split_strings <- stringr::str_split(string,",") %>% unlist()
+  product_code_index <- stringr::str_detect(split_strings,"device_report_product_code")
+  
+  # Select the correct string and set part after the "=" as the product code
+  # If statement is to handle case when device_report_product_code is missing (all FALSE values in index)
+  # e.g. when device is empty
+  if (any(product_code_index)){
+    product_code <- split_strings[product_code_index] %>%
+      stringr::str_split("=") %>% 
+      unlist()
+    
+  } else(return(NA))
+  
+  # First element of vector is just the variable name (device_report_product_code)
+  product_code <- product_code[2]
+  
+  # Turn implicit NAs ("") into explicit ones
+  product_code = if_else(product_code == "",NA_character_,product_code)
+  
+  return(product_code)
+}
+
+
+temp_df <- event_data %>%
+  select(event_type,device) %>%
+  mutate(
+    # Get product code 
+    product_code = lapply(device,get_product_code) %>% unlist(),
+
+    ) %>%
+  group_by(product_code) %>%
+  summarize(n_injuries = sum(event_type == "Injury"))
+
+temp_df %>% filter(n_injuries == max(n_injuries)) %>%
+  knitr::kable()
+```
+Looks like `LWS` has the highest number of injuries (600).
+
+## Part 3
+
+Choose and show a time-series trend of increasing, decreasing or level event frequency by device category. Comment on the confidence of this analysis based on the underlying data.
+
+## Solution
+
+I'm going to interpret the increasing, decreasing, or level (constant) requirement of the frequency to refer to the *trend* of the frequency.  The simplest approach (I think) is to use the relationship between frequency of events and the time between each event - if the time between events is decreasing, then the frequency is increasing; if the time between events is increasing, then the frequency is decreasing; and if the the time between events is constant, then the frequency is also constant.  Therefore my approach is as follows:
+
+1. Get the product codes and dates for each event
+2. Get the time difference between each event consecutive event in each device category time series
+3. Pick a relatively large time series (just so we have more data to work with)
+4. Regress the time differences on their index to quantify whether the time difference is increasing, decreasing, or constant (and therefore the behavior of the frequency).
+
+```{r}
+temp_df <- event_data %>% 
+  select(date_of_event,device) %>%
+  mutate(
+    # Get product code 
+    product_code = lapply(device,get_product_code) %>% unlist(),
+    # Parse date (assuming ymd is the correct format) and extract year
+    date_of_event = lubridate::ymd(date_of_event)
+    ) %>%
+  arrange(product_code,date_of_event) %>%
+  group_by(product_code) %>%
+  # Get time difference between events in series
+  mutate(
+    time_difference = date_of_event - lag(date_of_event)
+  )
+```
+
+Let's try to pick a decently long series
+```{r}
+longest_product_code_series <- temp_df %>% 
+  tally() %>%
+  arrange(desc(n)) %>%
+  slice(1:10)
+
+longest_product_code_series %>% knitr::kable()
+```
+
+I visualed a few of these (not shown), and `LZG` looks like an interesting series - let's pick it.
+
+```{r}
+# Isolate that series
+LZG_df <- temp_df %>% 
+  ungroup() %>%
+  filter(product_code == "LZG") %>%
+  mutate(
+    time_difference = as.numeric(time_difference),
+    index = row_number()
+    )
+
+
+# Plot it
+LZG_df %>%
+  ggplot(aes(x = index,y = time_difference)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  labs(x = "Index",y = "Time difference")
+```
+
+The scale looks weird because there is one very large time difference near the beginning.
+```{r}
+# Run regression
+LZG_lm <- LZG_df %>%
+  lm(time_difference ~ index,data = .)
+
+summary(LZG_lm)
+```
+
+If we examine the regression output (the `index` coefficient) we see that ``statistically'' the time differences are decreasing on average (i.e. frequency of events is increasing), but 
+
+1. The practical effect appears to be very small - the expected difference between two consecutive time intervals is 1/20th of a day.
+2. This result is partially driven by a single large time difference near the beginning of the time series - for the vast majority of the time `LZG` products have been reported, the time differences have on average been very close to constant.
+
+So I'm comfortable calling this a series of events with roughly constant frequency.  I'm fairly confident in this result as well -  there are very few `LZG` events without dates, so the sensitivity of results of my conclusion to their omission is limited (and furthermore the time differences are all relatively short which further limits the influence of undated `LZG` events that occur between existing events).
+
+My one caveat would be I don't know how this dataset was produced or what constitutes a practically significant effect size in this space.
+
+
+# Bonus Question
+
+The `mdr_text` field often has a detailed text description of the issue that occurred with the device. If there is anything fun or interesting you can think to do with this data, we'd love to see it!
+
+## Solution
+
+I thought it would be fun to see what the characteristic/important words are for the most reported product codes, so I take a simple tf-idf approach.
+
+```{r}
+get_mdr_text <- function(string){
+  # Grab everything after the text= part (assuming that)
+  split_strings <- stringr::str_split(string,"text=") %>% unlist()
+  
+  # Strip non alphanumeric characters and make lowercase
+  stripped_string <- textTools::str_rm_non_alphanumeric(split_strings[2]) %>%
+    tolower()
+  
+  # Tokenize
+  
+  tokens <- stripped_string %>%
+    stringr::str_squish() %>%
+    stringr::str_split(" ") %>% 
+    unlist()
+  
+  # Remove stop words (just use what is pre-built in tidytext)
+  tokens <- data.frame("word" = tokens) %>%
+    anti_join(tidytext::stop_words,by = "word")
+  
+  # Stemming
+  tokens <- tokens %>%
+    mutate(word = SnowballC::wordStem(word)) %>%
+    pull(word)
+  
+  return(tokens)
+}
+
+# Get tokens into a tidy format with tf-idf transformation
+# For the purposes of this analysis, I'm going to pool the product codes together
+# and treat them as one document
+results_df <- event_data %>% 
+  select(device,mdr_text) %>%
+  mutate(
+    # Extract product codes
+    product_code = lapply(device,get_product_code) %>% unlist()
+    ) %>%
+  # Create new dataframe in tidy format with 1 row per word per document (with count)
+  group_by(product_code) %>%
+  summarize(token = lapply(mdr_text, get_mdr_text) %>% unlist()) %>%
+  group_by(product_code,token) %>% 
+  summarize(n_occurrences = n()) %>%
+  # Get tf_idf values
+  ungroup() %>%
+  tidytext::bind_tf_idf(
+    term = token,
+    document = product_code,
+    n = n_occurrences) %>%
+  group_by(product_code) %>%
+  arrange(desc(tf_idf)) %>%
+  # Filter out all product codes except the ones we are interested in
+  # (top 10 longest time series)
+  # We can't do this earlier bc that would throw off tf-idf normalization
+  filter(product_code %in% longest_product_code_series$product_code)
+
+results_df %>%
+  slice(1:3) %>%
+  select(product_code,token,n_occurrences,tf_idf) %>%
+  knitr::kable()
+```
+
+It's hard to tell whether the most important tokens have to do with the nature of the issues that arise, or just the nature of the device itself (e.g. for `LZG` do does pump come up because pumping is involved, or because there are problems with the pump).  Clearly more investigation is needed!
+
+# Environment info
+
+```{r}
+sessionInfo()
+```
+
